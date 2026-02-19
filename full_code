@@ -1,0 +1,1801 @@
+#include "Pythia8/Pythia.h"
+#include <iostream>
+#include "TCanvas.h"
+#include "TRandom3.h"
+#include "TString.h"
+#include "TH1.h"
+#include "TH2F.h"
+#include "TFile.h"
+#include "TLegend.h"
+#include "TLegendEntry.h"
+#include "TStyle.h"
+#include "TF1.h"
+#include "TMath.h"
+#include "TBrowser.h"
+#include "TApplication.h"
+#include "fastjet/PseudoJet.hh"
+#include "fastjet/ClusterSequence.hh"
+#include "fastjet/tools/Subtractor.hh"
+#include "fastjet/tools/JetMedianBackgroundEstimator.hh"
+#include "fastjet/ClusterSequenceArea.hh"
+#include "fastjet/GhostedAreaSpec.hh"
+#include "fastjet/AreaDefinition.hh"
+#include "fastjet/Selector.hh"
+
+
+using namespace Pythia8;
+
+
+double pTmin_jet = 1; //only jets with pt>ptmin_jet are included in the vector jets; fastjet returns jets with only pt > ptmin_jet, i.e. what fastjet recognises as a real jet
+
+
+// =============================================================================================================================================
+// FOUR VECTORS
+// =============================================================================================================================================
+
+
+double Calculate_pX(double pT, double eta, double phi) {
+   return (pT * TMath::Cos(phi));
+}
+
+
+double Calculate_pY(double pT, double eta, double phi) {
+   return (pT * TMath::Sin(phi));
+}
+
+
+double Calculate_pZ(double pT, double eta, double phi) {
+   return (pT * TMath::SinH(eta));
+}
+
+
+double Calculate_E(double pT, double eta, double phi) {
+   double pZ = Calculate_pZ(pT, eta, phi);
+   return TMath::Sqrt(pT * pT + pZ * pZ);
+}
+
+
+// =============================================================================================================================================
+// DEFINE TRACK CUTS AS FUNCTIONS
+// =============================================================================================================================================
+
+
+bool EtaCut(fastjet::PseudoJet fjJet, double etaMin, double etaMax) {
+   if(fjJet.eta() > etaMax || fjJet.eta() < etaMin){
+       return false;
+   }else{
+       return true;
+   }
+}
+
+
+double DeltaR(double eta1, double phi1, double eta2, double phi2) {
+   double dEta = eta1 - eta2;
+   double dPhi = phi1 - phi2;
+
+
+   if (dPhi > TMath::Pi()){
+       dPhi -= 2 * TMath::Pi();
+   }
+   if (dPhi < -TMath::Pi()){
+       dPhi += 2 * TMath::Pi();
+   }
+
+
+   return sqrt(dEta * dEta + dPhi * dPhi);
+}
+
+
+// =============================================================================================================================================
+// FLOW SECTION, DEFINING FLOW DISTRIBUTIONS TO SAMPLE FROM
+// =============================================================================================================================================
+
+
+const int N_V2_BINS = 13;
+
+
+double v2_edges[N_V2_BINS + 1] = {
+   0.2, 0.4, 0.6, 0.8, 1.0,
+   1.25, 1.50, 1.75,
+   2.0, 2.5, 3.0, 3.5, 4.0, 5.0
+};
+
+
+double v2_vals[N_V2_BINS] = {
+   0.01535, 0.02495, 0.02827, 0.0348, 0.04059,
+   0.0495, 0.0573, 0.05866,
+   0.0630, 0.06669, 0.08123, 0.04895, 0.07954
+};
+
+
+TF1* flowFuncs[N_V2_BINS] = {nullptr};
+
+
+int find_v2_bin(double pt) {
+   // pT outside covered range - no v2 (no flow)
+   if (pt < v2_edges[0] || pt >= v2_edges[N_V2_BINS])
+       return -1;
+
+
+   for (int i = 0; i < N_V2_BINS; ++i) {
+       if (pt >= v2_edges[i] && pt < v2_edges[i+1])
+           return i;
+   }
+   return -1;
+}
+
+
+// =============================================================================================================================================
+
+
+class ParticleOriginInfo : public fastjet::PseudoJet::UserInfoBase {
+public:
+   ParticleOriginInfo(int flag) : _flag(flag) {}
+   int flag() const { return _flag; }
+  
+private:
+   int _flag;
+};
+
+
+int main(int argc, char** argv) {
+
+
+// =============================================================================================================================================
+// FLOW SECTION, GENERATING ALL TF1 DISTRIBUTIONS DEPENDING ON V2 BIN TO SAMPLE FROM
+// =============================================================================================================================================
+
+
+// generate all flow functions in one loop, before generating all the events
+for (int i = 0; i < N_V2_BINS; ++i) {
+   TString name = Form("flow_func_%d", i);
+   double v2 = v2_vals[i];
+
+
+   TString formula = Form("1 + 2*%.8f*TMath::Cos(2*x)", v2);
+
+
+   flowFuncs[i] = new TF1(name, formula, 0.0, 2.0 * TMath::Pi());
+}
+// =============================================================================================================================================
+
+
+   Pythia pythia;
+   pythia.readString("HardQCD:all=on");  
+   pythia.readString("PhaseSpace:pTHatMin = 40.");  
+   pythia.readString("Beams:eCM = 5020."); //5.02 TeV, used to be 13TeV
+
+
+   // user input for number of events and implementing elliptic v2 flow
+   int events;
+   bool flow_flag;
+   std::cout << "number of events: ";
+   std::cin >> events;
+   std::cout << "flow (0/1): ";
+   std::cin >> flow_flag;
+
+
+ TApplication app("app", &argc, argv);
+ // global style: no stats boxes, nice palette
+gStyle->SetOptStat(0);          // removes the Entries/Mean/RMS box everywhere
+gStyle->SetPalette(kBird);      // or kRainBow, kViridis, etc.
+gStyle->SetNumberContours(50);  // smoother color gradients
+
+
+ int hbins=100;
+ int hmax = 500; 
+ int n_jets = 0;
+ int n_jets_total = 0;
+ int n_pythia_jets = 0;
+ int n_pythia_jets_total = 0;
+ int n_combined_jets = 0;
+ int n_combined_jet_total = 0;
+ int n_th_jets = 0;
+ int n_th_jets_total = 0;
+
+
+ int pt_cut = 60;
+
+
+
+
+ //sample from
+TFile* input_file = TFile::Open("/Users/lilywonder/Desktop/ChMultAlice.root");
+TH1F* input_histogram = (TH1F*) input_file->Get("ChMult_05");
+
+
+ // define new histograms file
+ TFile* outFile = new TFile("/Users/lilywonder/Desktop/histograms.root", "recreate");
+ //TH1F* hthTotal = new TH1F("hthTotal", "Leading Jet pT (Thermal); Jet pT; Number of Events", hbins, 0, hmax);
+ TH1F* h_nThermal = new TH1F("h_nThermal", "Gaussian Number of Particles; Number of Thermal Particles; Number of Events", 100, 3700, 4100);
+
+
+ // pythia jet spectra
+ TH1F* hist_pythia_jet_pt = new TH1F("hist_pythia_jet_pt", "Jet pT (Pythia); Jet pT; Number of Events", hbins, 0, 200);
+ TH1F* hist_pythia_jet_eta = new TH1F("hist_pythia_jet_eta", "Jet Eta (Pythia); Jet Eta; Number of Events", 100, -1, 1);
+ TH1F* hist_pythia_jet_phi = new TH1F("hist_pythia_jet_phi", "Jet Phi (Pythia); Jet Phi; Number of Events", 100, 0, 10);
+ // thermal jet spectra
+ TH1F* hist_thermal_jet_pt = new TH1F("hist_thermal_jet_pt","Jet pT (Thermal); Jet pT; Number of Events", hbins, 0, 200);
+ TH1F* hist_thermal_jet_eta = new TH1F("hist_thermal_jet_eta","Jet Eta (Thermal); Jet Eta; Number of Events", 100, -1, 1);
+ TH1F* hist_thermal_jet_phi = new TH1F("hist_thermal_jet_phi","Jet Phi (Thermal); Jet Phi; Number of Events", 100, 0, 10);
+ // combined jet spectra
+ TH1F* hist_combined_jets_pt = new TH1F("hist_combined_jets_pt", "Combined Jet p_{T} (Pythia and Thermal Particles); p_{T}^{Jet} [GeV]; 1/N_{jets} dN/dp_{T}^{Jet}", hbins, 60, 250);
+ TH1F* hist_combined_jets_eta = new TH1F("hist_combined_jets_eta", "Jet Eta (Pythia and Thermal Particles); Jet Eta; Number of Events", 100, -1, 1);
+ TH1F* hist_combined_jets_phi = new TH1F("hist_combined_jets_phi", "Jet Phi (Pythia and Thermal Particles); Jet Phi; Number of Events", 100, 0, 10);
+
+
+ // thermal particle spectra
+// Create a new empty histogram with identical binning
+// TH1F* hist_f_pt = (TH1F*) input_histogram->Clone("hist_f_pt");
+TH1F* hist_f_pt = new TH1F("hist_f_pt", "Thermal Particles p_{T}; P_{T} [GeV]; 1/N_{jets} dN/dp_{T}^{track}", 100, 0, 5);
+
+
+// Clear the cloned contents
+// hist_f_pt->Reset();
+//hist_f_pt->SetTitle("Thermal Particles pT Distribution");
+//hist_f_pt->GetXaxis()->SetTitle("pT [GeV]");
+//hist_f_pt->GetYaxis()->SetTitle("Counts");
+//hist_f_pt->GetXaxis()->SetRangeUser(0, 5);
+
+
+//hist_f_pt->GetXaxis()->SetRangeUser(0, 5);
+
+
+ TH1* hist_f_eta = new TH1F("hist_f_eta", "Thermal Particles Eta; Eta; Number of Entries", 100, -2, 2);
+ TH1* hist_f_phi = new TH1F("hist_f_phi", "Thermal Particles Phi; Phi; Number of Entries", 100, 0, 10);
+
+
+ TH2F* hist_f_eta_phi = new TH2F("hist_f_eta_phi",
+                               "Thermal Particles in Detector Space;#phi;#eta",
+                               72, 0, 2*TMath::Pi(),   // 72 bins -> 5° each
+                               40, -1.0, 1.0);   
+
+
+ TH1F* hist_rho = new TH1F("hist_rho", "FastJet Rho vs. Average Thermal Particles Rho per Jet; Rho; Number of Events", hbins, -100, 250);
+
+
+ // pythia particle spectra
+ TH1* hist_pythia_pt = new TH1F("hist_pythia_pt", "Pythia Particles pT; pT; Number of Entries", 100, 0, 5);
+ TH1* hist_pythia_eta = new TH1F("hist_pythia_eta", "Pythia Particles Eta; Eta; Number of Entries", 100, -2, 2);
+ TH1* hist_pythia_phi = new TH1F("hist_pythia_phi", "Pythia Particles Phi; Phi; Number of Entries", 100, 0, 10);
+ // combined particle spectra
+ TH1* hist_combined_particles_pt = new TH1F("hist_combined_particles_pt", "Combined Particles pT; pT; Number of Entries", 100, 0, 5);
+ hist_combined_particles_pt->SetMaximum(0);
+ TH1* hist_combined_particles_eta = new TH1F("hist_combined_particles_eta", "Combined Particles Eta; Eta; Number of Entries", 100, -2, 2);
+ TH1* hist_combined_particles_phi = new TH1F("hist_combined_particles_phi", "Combined Particles Phi; Phi; Number of Entries", 100, 0, 10);
+
+
+ // pythia jet constituent spectra
+TH1* hist_pythia_jet_constituents_pt =
+   new TH1F("hist_pythia_jet_constituents_pt",
+            "Pythia Jet Constituent Particles pT; p_{T} [GeV]; Constituents",
+            100, 0, 5);
+hist_pythia_jet_constituents_pt->Sumw2();
+ TH1* hist_pythia_jet_constituents_eta = new TH1F("hist_pythia_jet_constituents_eta", "Pythia Jet Constituent Particles Eta; Eta; Number of Events", 100, -1, 1);
+ TH1* hist_pythia_jet_constituents_phi = new TH1F("hist_pythia_jet_constituents_phi", "Pythia Jet Constituent Particles Phi; Phi; Number of Events", 100, 0, 10);
+ // thermal jet constituent spectra
+ TH1* hist_thermal_jet_constituents_pt = new TH1F("hist_thermal_jet_constituents_pt", "Thermal Jet Constituent Particles pT; pT; Number of Events", 100, 0, 5);
+ TH1* hist_thermal_jet_constituents_eta = new TH1F("hist_thermal_jet_constituents_eta", "Thermal Jet Constituent Particles Eta; Eta; Number of Events", 250, -1, 1);
+ TH1* hist_thermal_jet_constituents_phi = new TH1F("hist_thermal_jet_constituents_phi", "Thermal Jet Constituent Particles Phi; Phi; Number of Events", 100, 0, 10);
+// thermal jet constituent spectra
+ TH1* hist_combined_jet_constituents_pt = new TH1F("hist_combined_jet_constituents_pt", "Combined Jet Constituent Particles pT; pT; Number of Events", 100, 0, 5);
+ TH1* hist_combined_jet_constituents_eta = new TH1F("hist_combined_jet_constituents_eta", "Combined Jet Constituent Particles Eta; Eta; Number of Events", 250, -1, 1);
+ TH1* hist_combined_jet_constituents_phi = new TH1F("hist_combined_jet_constituents_phi", "Combined Jet Constituent Particles Phi; Phi; Number of Events", 100, 0, 10);
+
+
+// perpendicular particles spectra
+TH1F* hist_perp_particles_pt =
+   new TH1F("hist_perp_particles_pt",
+            "Recovering the Original Jet Signal; p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+            100, 0, 5);
+hist_perp_particles_pt->Sumw2();
+TH1F* hist_subt_particles_pt =
+   new TH1F("hist_subt_particles_pt",
+            "Recovering the Original Jet Signal; p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+            100, 0, 5);
+hist_subt_particles_pt->Sumw2();
+
+
+TH1F* leading_jet_thparticles_pt =
+   new TH1F("leading_jet_thparticles_pt",
+            "Recovering the Original Jet Signal; p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+            100, 0, 5);
+leading_jet_thparticles_pt->Sumw2();
+
+
+TH1F* h_corr =
+   new TH1F("h_corr",
+            "Correction Factor; p_{T}^{track} [GeV]; Ratio",
+            100, 0, 5);
+h_corr->Sumw2();
+
+
+ TH1* hist_perp_particles_eta = new TH1F("hist_perp_particles_eta", "Perpendicular Particles Eta; Eta; Number of Events", 100, -1, 1);
+ TH1* hist_perp_particles_phi = new TH1F("hist_perp_particles_phi", "Perpendicular Particles Phi; Phi; Number of Events", 100, 0, 10);
+
+
+ TH1F* hist_subt_pt = new TH1F("hist_subt_pt", "p_{T}-Corrected Jet p_{T}; p_{T}^{Jet} [GeV]; 1/N_{jets} dN/dp_{T}^{Jet}", hbins, 60, 250);
+ TH1F* hist_perp_sum = new TH1F("hist_perp_sum", "Perp Thermal Particles Vector Sum; pT; Number of Events", hbins, 0, hmax);
+ TH1F* hist_delta_pt = new TH1F("hist_delta_pt", " ; #Delta p_{T}^{track} [GeV]; dN/d(#Delta p_{T}^{track})", hbins, -60, 60);
+
+
+ TH1F* hist_th_rho = new TH1F("hist_th_rho", "Thermal Rho Reproduced; pT; Number of Events", hbins, 0, hmax);
+
+
+ // sanity checks for jet finders -- goal is to make sure the area cut is not too restrictive and that the below-cut and above-cut add up to the no-cut
+ TH1* sanity_check_below_areacut = new TH1F("hist_below", "Thermal Jet pT Area Sanity Check below Area Cut; pT; Number of Events", 100, 0, 200);
+ TH1* sanity_check_above_etacut = new TH1F("hist_above", "Combined Jet Constituents Sanity Check above Eta Cut; Eta; Number of Events", 250, -1.5, 1.5);
+ TH1* sanity_check_areafull = new TH1F("hist_full", "Thermal Jet pT Area Sanity Check No Area Cut; pT; Number of Events", 100, 0, 200);
+
+
+ TCanvas* c1 = new TCanvas("c1", "Number of Thermal Particles Gaussian Dist", 800, 600);
+ TCanvas* c2 = new TCanvas("c2", "Pythia Jet pT", 800, 600);
+ TCanvas* c3 = new TCanvas("c3", "Pythia Jet Eta", 800, 600);
+ TCanvas* c4 = new TCanvas("c4", "Pythia Jet Phi", 800, 600);
+ TCanvas* c5 = new TCanvas("c5", "Thermal Jet pT", 800, 600);
+ TCanvas* c6 = new TCanvas("c6", "Thermal Jet Eta", 800, 600);
+ TCanvas* c7 = new TCanvas("c7", "Thermal Jet Phi", 800, 600);
+ TCanvas* c8 = new TCanvas("c8", "Combined Jets pT", 800, 600);
+ TCanvas* c9 = new TCanvas("c9", "Combined Jets Eta", 800, 600);
+ TCanvas* c10 = new TCanvas("c10", "Combined Jets Phi", 800, 600);
+ TCanvas* c11 = new TCanvas("c11", "Thermal Particles pT", 1000, 1000);
+ TCanvas* c12 = new TCanvas("c12", "Thermal Particles Eta", 800, 600);
+ TCanvas* c13 = new TCanvas("c13", "Thermal Particles Phi", 800, 600);
+ TCanvas* c14 = new TCanvas("c14", "Rho", 800, 600);
+ TCanvas* c15 = new TCanvas("c15", "Pythia Particles pT", 800, 600);
+ TCanvas* c16 = new TCanvas("c16", "Pythia Partices Eta", 800, 600);
+ TCanvas* c17 = new TCanvas("c17", "Pythia Particles Phi", 800, 600);
+ TCanvas* c18 = new TCanvas("c18", "Combined Particles pT", 800, 600);
+ TCanvas* c19 = new TCanvas("c19", "Combined Particles Eta", 800, 600);
+ TCanvas* c20 = new TCanvas("c20", "Combined Particles Phi", 800, 600);
+ TCanvas* c21 = new TCanvas("c21", "Pythia Constituents pT", 800, 600);
+ TCanvas* c22 = new TCanvas("c22", "Pythia Constituents Eta", 800, 600);
+ TCanvas* c23 = new TCanvas("c23", "Pythia Constituents Phi", 800, 600);
+ TCanvas* c24 = new TCanvas("c24", "Thermal Constituents pT", 800, 600);
+ TCanvas* c25 = new TCanvas("c25", "Thermal Constituents Eta", 800, 600);
+ TCanvas* c26 = new TCanvas("c26", "Thermal Constituents Phi", 800, 600);
+ TCanvas* c27 = new TCanvas("c27", "Combined Constituents pT", 800, 600);
+ TCanvas* c28 = new TCanvas("c28", "Combined Constituents Eta", 800, 600);
+ TCanvas* c29 = new TCanvas("c29", "Combined Constituents Phi", 800, 600);
+ TCanvas* c30 = new TCanvas("c30", "Sanity Check Above Eta Cut", 800, 600);
+ TCanvas* c31 = new TCanvas("c31", "Sanity Check Below Eta Cut", 800, 600);
+ TCanvas* c32 = new TCanvas("c32", "Sanity Check No Eta Cut", 800, 600);
+ TCanvas* c33 = new TCanvas("c33", "Perp Particles Eta", 800, 600);
+ TCanvas* c34 = new TCanvas("c34", "Perp Particles Phi", 800, 600);
+ TCanvas* c35 = new TCanvas("c35", "Perp Particles pT", 800, 600);
+ TCanvas* c36 = new TCanvas("c36", "Subtracted Jet pT", 800, 600);
+ TCanvas* c37 = new TCanvas("c37", "Perp Sum", 800, 600);
+ TCanvas* c38 = new TCanvas("c38", "Delta pT", 800, 600);
+ TCanvas* c40 = new TCanvas("c40", "Correction Factor", 800, 600);
+
+
+ int naverage = 3922;
+ int sigman = 40;
+ TRandom3 *random = new TRandom3();
+
+
+// create a custom data type, Particle
+ struct Thparticle {
+     int id; 
+     double pt;
+     double eta;
+     double phi;
+     double px;
+     double py;
+     double pz;
+     double E;
+
+
+     Thparticle(int id_, double pt_, double eta_, double phi_, double px_, double py_, double pz_, double E_)
+         : id(id_), pt(pt_), eta(eta_), phi(phi_), px(px_), py(py_), pz(pz_), E(E_) {}
+ };
+ // create a vector containing these new thermal particles
+ std::vector<Thparticle> thparticles;
+ std::vector<Thparticle> pythia_particles;
+ std::vector<Thparticle> combined_particles;
+ std::vector<Thparticle> perp_particles;
+
+
+ double min_eta = -1;
+ double max_eta = 1;
+ double min_part_pt = 0.15;
+
+
+ // define thermal functions
+ //TF1* f_pT = new TF1("f_pT","x*exp(-x/0.4)", 0.0, 400.0); // pt function for thermal particles
+ //f_pT->SetNpx(40000);
+  TF1* f_pT = new TF1("f_pT", "0.798*x*pow(1 + x/(11.191*0.243), -11.191)", 0.0, 10.0);
+ f_pT->SetNpx(5000);
+
+
+ TF1* f_eta = new TF1("f_eta", "1", min_eta, max_eta);
+ TF1* f_phi = new TF1("f_phi", "1", 0.0, 2*TMath::Pi());
+
+
+ //set up jet algorithm
+   fastjet::JetDefinition jetDef(fastjet::antikt_algorithm, 0.4);
+   fastjet::JetDefinition jetDef2(fastjet::kt_algorithm, 0.4);
+   double jetAreaCut = 0.6*jetDef.R()*jetDef.R()*TMath::Pi();
+   double trackEtaCut = 0.9;
+   double etamin_Sig = - trackEtaCut + jetDef.R(); // signal jet eta range
+   double etamax_Sig = - etamin_Sig;
+
+
+   std::vector<fastjet::PseudoJet> jet_components;
+   std::vector<fastjet::PseudoJet> jet_thcomponents;
+   std::vector<fastjet::PseudoJet> combined_components;
+   std::vector<fastjet::PseudoJet> leading_combined_jets;
+
+
+   std::vector<double> perp_cone_median_values;
+   std::vector<double> th_cone_median_values;
+ //set up background estimator
+   fastjet::Selector BGSelector = fastjet::SelectorAbsEtaMax(1.0)*(!fastjet::SelectorNHardest(2));
+   fastjet::GhostedAreaSpec ghost_spec(0.9, 1, 0.005);//Ghosts to calculate the Jet Area
+   fastjet::AreaDefinition fAreaDefBG(fastjet::active_area_explicit_ghosts, ghost_spec);
+   fastjet::AreaDefinition fAreaDef(fastjet::passive_area, ghost_spec);
+
+
+
+
+// if Pythia fails to initialize, exit with error.
+     if (!pythia.init()) return 1;
+ // =============================================================================================================================================
+ // MAJOR TIER LOOP FOR EVENT GENERATION (i counter runs until all events are generated)
+ // =============================================================================================================================================
+
+
+     for(int i=0; i<events; ++i){ // generate i number of events in pythia
+    
+     jet_components.clear();
+     jet_thcomponents.clear();   
+     thparticles.clear();
+     combined_components.clear();
+     combined_particles.clear();
+     pythia_particles.clear();
+     leading_combined_jets.clear();
+
+
+     n_pythia_jets = 0;
+     n_combined_jets = 0;
+     n_th_jets = 0;
+
+
+     if (!pythia.next()) continue;
+
+
+     int nThermal = random->Gaus(naverage,sigman);
+     h_nThermal->Fill(nThermal);
+        
+     for(int j=0; j<pythia.event.size(); ++j){ // select final particles       
+      
+       if(pythia.event[j].isFinal() && pythia.event[j].isCharged()){
+       //** particle spectra for pythia, pt, eta, phi
+
+
+           if(pythia.event[j].pT() > min_part_pt && pythia.event[j].eta() < trackEtaCut && pythia.event[j].eta()> -trackEtaCut){
+
+
+           hist_pythia_pt->Fill(pythia.event[j].pT());
+           hist_pythia_eta->Fill(pythia.event[j].eta());
+           hist_pythia_phi->Fill(pythia.event[j].phi()+TMath::Pi());
+
+
+           fastjet::PseudoJet pj(pythia.event[j].px(), pythia.event[j].py(), pythia.event[j].pz(), pythia.event[j].e());
+           pj.set_user_info(new ParticleOriginInfo(pythia.event[j].id()));
+           jet_components.push_back(pj); //adds particle to end of vector
+
+
+           //store pythia particles in a vector to be combined with thermal particles later on
+           double phi_shifted = pythia.event[j].phi() + TMath::Pi();
+           Thparticle pythia_single_particle(pythia.event[j].id(), pythia.event[j].pT(), pythia.event[j].eta(),
+                                           phi_shifted, pythia.event[j].px(), pythia.event[j].py(),
+                                           pythia.event[j].pz(), pythia.event[j].e());
+           pythia_particles.push_back(pythia_single_particle);
+           }
+         }
+        }
+
+
+         fastjet::ClusterSequenceArea cs(jet_components, jetDef, fAreaDef); //makes a jet from the component particles from j-for loop for each i event
+         std::vector<fastjet::PseudoJet> jets = cs.inclusive_jets(pTmin_jet); // !!filters through jets to ensure they are above ptmin_jet for each i event
+
+
+         for (const auto& jet : jets) {
+        if ( jet.perp() >= pt_cut &&
+        EtaCut(jet, etamin_Sig, etamax_Sig) &&
+        jet.area() > jetAreaCut ) {
+
+
+       hist_pythia_jet_pt->Fill(jet.pt());
+       hist_pythia_jet_eta->Fill(jet.eta());
+       hist_pythia_jet_phi->Fill(jet.phi());
+
+
+       n_pythia_jets++;   // count only jets used in the analysis
+   }
+       }
+ // =============================================================================================================================================
+ // SECOND TIER LOOP FOR THERMAL PARTICLE CREATION (within the MAJOR LOOP for each range, counter m runs until x number of particles have been created from a Gaussian distribution)
+ // =============================================================================================================================================
+
+
+     for (int m=0; m<nThermal; m++){
+
+
+         double pt = f_pT->GetRandom();
+         double eta = f_eta->GetRandom();
+         double phi;
+   // =============================================================================================================================================
+   // SECOND TIER LOOP, CREATING THERMAL PARTICLES WITH ELLIPTIC FLOW
+   // =============================================================================================================================================
+
+
+       if (flow_flag) {
+           int bin = find_v2_bin(pt);
+           if (bin >= 0) {
+               // use the pre-built TF1 for this pT bin
+               phi = flowFuncs[bin]->GetRandom();
+           } else {
+               // pT out of range - no flow modulation
+               phi = f_phi->GetRandom();   // or random->Uniform(0, 2pi)
+           }
+       } else {
+           // no flow at all
+           phi = f_phi->GetRandom();       // or random->Uniform(0, 2pi)
+       }
+
+
+   // =============================================================================================================================================
+
+
+         double px = Calculate_pX(pt, eta, phi);
+         double py = Calculate_pY(pt, eta, phi);
+         double pz = Calculate_pZ(pt, eta, phi);
+         double E  = Calculate_E(pt, eta, phi);
+
+
+         Thparticle thermal_single_particle(-1, pt, eta, phi, px, py, pz, E);
+
+
+         if(thermal_single_particle.pt > min_part_pt && thermal_single_particle.eta > -trackEtaCut && thermal_single_particle.eta < trackEtaCut){
+         thparticles.push_back(thermal_single_particle);
+
+
+         //jet_thcomponents.push_back(fastjet::PseudoJet(thparticles[m].px, thparticles[m].py, thparticles[m].pz, thparticles[m].E));
+         fastjet::PseudoJet thj(px, py, pz, E);
+         thj.set_user_info(new ParticleOriginInfo(-1));
+         jet_thcomponents.push_back(thj);
+
+
+   //** particle spectra for thermal, pt, eta, phi
+     hist_f_pt->Fill(thermal_single_particle.pt);
+     hist_f_eta->Fill(thermal_single_particle.eta);
+     hist_f_phi->Fill(thermal_single_particle.phi);
+
+
+     // fill 2D (phi, eta) map
+       hist_f_eta_phi->Fill(thermal_single_particle.phi,
+                    thermal_single_particle.eta);
+
+
+         }   
+   }
+// =============================================================================================================================================
+// BACKGROUND RHO, the median background density per unit area
+// =============================================================================================================================================
+
+
+   fastjet::JetMedianBackgroundEstimator   bg(BGSelector, jetDef2, fAreaDefBG);
+   bg.set_particles(jet_thcomponents);
+   hist_rho->Fill(bg.rho());
+
+
+   fastjet::ClusterSequenceArea cs2(jet_thcomponents, jetDef2, fAreaDefBG); //makes a jet from the component particles from j-for loop for each i event
+   std::vector<fastjet::PseudoJet> thjets = cs2.inclusive_jets(pTmin_jet); //filters through jets to ensure they are above ptmin_jet for each i event; do we want ptmin for the thermal jet as well?
+
+
+      //** jet spectra for Thermal, pt, eta, phi
+      for (const auto& thjet : thjets) {
+        /*   double real_pt = 0.0;
+           for (const auto& part : thjet.constituents()) {
+                   if (part.is_pure_ghost()) continue;
+                   real_pt = part.pt();
+               }*/
+
+
+         if (!thjets.empty()) {
+         hist_thermal_jet_pt->Fill(thjet.pt());
+         hist_thermal_jet_eta->Fill(thjet.eta());
+         hist_thermal_jet_phi->Fill(thjet.phi());
+
+
+         n_th_jets++;
+
+
+       }
+
+
+      /* if(!thjets.empty() && thjet.perp() >= 60.0 && EtaCut(thjet, etamin_Sig, etamax_Sig) && thjet.area() < jetAreaCut){
+           sanity_check_below_areacut->Fill(thjet.pt());
+       }
+       if(!thjets.empty() && thjet.perp() >= 60.0 && EtaCut(thjet, etamin_Sig, etamax_Sig)){
+           sanity_check_areafull->Fill(thjet.pt());
+       }*/
+   }
+
+
+// =============================================================================================================================================
+// MAJOR TIER LOOP FOR COMBINING PYTHIA AND THERMAL PARTICLES
+// =============================================================================================================================================
+
+
+       combined_components.insert(combined_components.end(), jet_thcomponents.begin(), jet_thcomponents.end());
+       combined_components.insert(combined_components.end(), jet_components.begin(), jet_components.end());
+
+
+       fastjet::ClusterSequenceArea cs_combined(combined_components, jetDef, fAreaDef);
+       std::vector<fastjet::PseudoJet> combined_jets = cs_combined.inclusive_jets(0.0);
+
+
+       leading_combined_jets.push_back(combined_jets[0]);
+
+
+   //create new vector containing both pythia and thermal particles
+   combined_particles.insert(combined_particles.end(), pythia_particles.begin(), pythia_particles.end());
+   combined_particles.insert(combined_particles.end(), thparticles.begin(), thparticles.end());
+
+
+    //** particle spectra for combined, pt, eta, phi
+   for (const auto& p : combined_particles) {
+   hist_combined_particles_pt->Fill(p.pt);
+   hist_combined_particles_eta->Fill(p.eta);
+   hist_combined_particles_phi->Fill(p.phi);
+
+
+   }
+
+
+   //** jet spectra for Combined, pt, eta, phi
+   for (const auto& cjet : combined_jets) {
+
+
+   if (!combined_jets.empty() && cjet.perp() >= pt_cut && EtaCut(cjet, etamin_Sig, etamax_Sig) && cjet.area() > jetAreaCut) {
+
+
+   hist_combined_jets_pt->Fill(cjet.pt());
+   hist_combined_jets_eta->Fill(cjet.eta());
+   hist_combined_jets_phi->Fill(cjet.phi());
+
+
+   n_combined_jets++;
+   }
+}
+
+
+   for (const auto& jet : jets) {
+if ( jet.perp() >= pt_cut &&
+        EtaCut(jet, etamin_Sig, etamax_Sig) &&
+        jet.area() > jetAreaCut ) {
+   std::vector<fastjet::PseudoJet> parts = jet.constituents(); //access constituents
+       for(const auto& part : parts){
+
+
+           if(part.pt()>min_part_pt){
+           hist_pythia_jet_constituents_pt->Fill(part.pt());
+           hist_pythia_jet_constituents_eta->Fill(part.eta());
+           hist_pythia_jet_constituents_phi->Fill(part.phi());
+           }
+
+
+       }
+       }
+   }
+
+
+    for (const auto& thjet : thjets) {
+       if (!thjets.empty() && EtaCut(thjet, etamin_Sig, etamax_Sig) && thjet.area() > jetAreaCut) {
+
+
+   std::vector<fastjet::PseudoJet> thparts = thjet.constituents(); //access constituents
+       for(const auto& thpart : thparts){
+
+
+           if(thpart.pt()>min_part_pt){
+           hist_thermal_jet_constituents_pt->Fill(thpart.pt());
+           hist_thermal_jet_constituents_eta->Fill(thpart.eta());
+           hist_thermal_jet_constituents_phi->Fill(thpart.phi());
+           }
+          
+       }
+   }
+    }
+
+
+     for (const auto& cjet : combined_jets) {
+
+
+       if (!combined_jets.empty() && cjet.perp() >= pt_cut && EtaCut(cjet, etamin_Sig, etamax_Sig) && cjet.area() > jetAreaCut) {
+
+
+   std::vector<fastjet::PseudoJet> cparts = cjet.constituents(); //access constituents
+       for(auto& cpart : cparts){
+
+
+           if(cpart.pt()>min_part_pt){
+           hist_combined_jet_constituents_pt->Fill(cpart.pt());
+           hist_combined_jet_constituents_eta->Fill(cpart.eta());
+           hist_combined_jet_constituents_phi->Fill(cpart.phi());
+           }
+
+
+           if(cpart.eta() > trackEtaCut|| cpart.eta() < -trackEtaCut){
+              //if (cpart.is_pure_ghost()) continue;
+               sanity_check_above_etacut->Fill(cpart.eta());
+           }
+
+
+//goal: check if the vector sum of the thermal particles in there matches that of the rho you calculate for the event
+
+
+       }
+   }
+}
+
+
+   n_jets = 0;
+    
+// =============================================================================================================================================
+// FASTJET RHO BACKGROUND SUBTRACTION
+// =============================================================================================================================================
+
+
+fastjet::Subtractor subtractor(bg.rho());
+std::vector<fastjet::PseudoJet> NewJets = subtractor(combined_jets); //fastjet automatically subtracts rho from its jet candidates
+
+
+// =============================================================================================================================================
+// PERPENDICULAR CONES, THERMAL CONSTITUENTS BACKGROUND SUBTRACTION
+// =============================================================================================================================================
+
+
+/*for(const auto& subtracted_jet : NewJets){
+
+
+   thcount = 0; // reset for each event
+   perp_sum_pt = 0;
+
+
+   if (!NewJets.empty() && subtracted_jet.perp() >= pt_cut && EtaCut(subtracted_jet, etamin_Sig, etamax_Sig) && subtracted_jet.area() > jetAreaCut) {
+
+
+   //std::cout << "jet phi: " << subtracted_jet.phi() << " ";
+
+
+ //  double rho_subt = subtracted_jet.pt() - bg.rho()*subtracted_jet.area();
+
+
+   if(subtracted_jet.pt() > pTmin_jet){
+   hist_subt_pt->Fill(subtracted_jet.pt()); //fastjet rho subtraction, depending on how effective fastjet is at background noise, which shifts the dist left
+   }
+   //hist_perp_sum->Reset();
+
+
+   for(const auto& thpart : subtracted_jet.constituents()){
+
+
+               if(thpart.has_user_info()){
+                   const ParticleOriginInfo info = thpart.user_info<ParticleOriginInfo>().flag();
+                   if (info.flag() == -1) {
+                       thcount += thpart.pt();
+                   }
+               }
+           }
+       n_jets++;
+
+
+      if(n_jets!=0){
+      hist_th_rho->Fill(thcount/(TMath::Pi()*jetDef.R()*jetDef.R()));
+   }
+
+
+       for(auto& subt_particle : subtracted_jet.constituents()){
+
+
+           if(subt_particle.pt() > min_part_pt){
+               hist_subt_particles_pt->Fill(subt_particle.pt());
+           }
+       }
+
+
+       double perp_phi = subtracted_jet.phi() + TMath::Pi()/2;
+
+
+       bool part_inside = false;
+
+
+       for(const auto& thpart : thparticles){
+           if(jetDef.R() > DeltaR(subtracted_jet.eta(), perp_phi, thpart.eta, thpart.phi)){
+               part_inside = true;
+           }else{
+               part_inside = false;
+           }
+
+
+           if(part_inside == true && thpart.pt > min_part_pt){
+              // std::cout << "th phi: " << thpart.phi << " ";
+               perp_particles.push_back(thpart);
+               hist_perp_particles_pt->Fill(thpart.pt);
+               hist_perp_particles_eta->Fill(thpart.eta);
+               hist_perp_particles_phi->Fill(thpart.phi);
+           }
+       }
+
+
+       for(auto& perp_particle : perp_particles){
+           perp_sum_pt += perp_particle.pt;
+       }
+
+
+       th_cone_median_values.push_back(thcount / (subtracted_jet.area()));
+       perp_cone_median_values.push_back(perp_sum_pt / (subtracted_jet.area()));
+
+
+       //hist_perp_sum->Fill(perp_sum_pt/(n_jets*TMath::Pi()*jetDef.R()*jetDef.R()));
+       perp_particles.clear();
+
+
+   }
+}*/
+
+
+// =============================================================================================================================================
+// DELTA PT, DIFFERENCE BETWEEN RHO*AREA AND SUM OF PERPENDICULAR PARTICLES' PT
+// =============================================================================================================================================
+
+
+// we want only one delta_pt per event, so let's find only the leading jet and its perpendicular cone
+
+
+if (!NewJets.empty()) {
+   // Find the leading jet (highest pt) from all the pt-corrected jets
+   std::vector<fastjet::PseudoJet> sorted_jets = fastjet::sorted_by_pt(NewJets);
+
+
+   // Apply cuts to leading jet
+if ( sorted_jets[0].perp() >= pt_cut &&
+        EtaCut(sorted_jets[0], etamin_Sig, etamax_Sig) &&
+        sorted_jets[0].area() > jetAreaCut ) {
+
+
+       n_jets++;  // count only leading jets that pass the same cuts
+
+
+   hist_subt_pt->Fill(sorted_jets[0].pt());
+
+
+   double perp_sum_pt_leading = 0;
+   double perp_phi_leading_jet = sorted_jets[0].phi() + TMath::Pi()/2; // Find the perpendicular cone to the leading jet
+
+
+       for(auto& subt_particle : sorted_jets[0].constituents()){
+           const auto& info = subt_particle.user_info<ParticleOriginInfo>();
+
+
+                   // Add all the constituents in the leading jet to a histogram
+                   if(subt_particle.pt() > min_part_pt){
+                       hist_subt_particles_pt->Fill(subt_particle.pt());
+
+
+                   if (info.flag() == -1) {
+                       // For correction factor, find all thermal particles in leading jet
+                       leading_jet_thparticles_pt->Fill(subt_particle.pt());
+                     }
+                   }
+               }
+
+
+       bool part_inside = false;
+
+
+       for(const auto& thpart : thparticles){
+           // For all the thermal particles generated in the event, check if they fall in this radius to the perpendicular jet axis
+           if(jetDef.R() > DeltaR(sorted_jets[0].eta(), perp_phi_leading_jet, thpart.eta, thpart.phi)){
+               part_inside = true;
+           }else{
+               part_inside = false;
+           }
+
+
+           if(part_inside == true && thpart.pt > 0){
+              // std::cout << "th phi: " << thpart.phi << " ";
+               perp_particles.push_back(thpart);
+               hist_perp_particles_pt->Fill(thpart.pt);
+               hist_perp_particles_eta->Fill(thpart.eta);
+               hist_perp_particles_phi->Fill(thpart.phi);
+           }
+       }
+
+
+        for(auto& perp_particle : perp_particles){
+           perp_sum_pt_leading += perp_particle.pt;
+       }
+
+
+// =============================================================================================================================================
+// CORRECTION FACTOR IN LEADING CONE
+// =============================================================================================================================================
+       for (int ibin = 1; ibin <= h_corr->GetNbinsX(); ++ibin) {
+
+
+   double bin_content_leading_jet_thparticles = leading_jet_thparticles_pt->GetBinContent(ibin);
+   double bin_content_pc = hist_perp_particles_pt->GetBinContent(ibin);
+
+
+   double ratio = 0.0;
+
+
+   if (bin_content_pc > 0.0) {
+       ratio = bin_content_leading_jet_thparticles / bin_content_pc;
+
+
+   }
+   h_corr->SetBinContent(ibin, ratio);
+}
+
+
+   // DELTA PT
+
+
+       double delta_pt = bg.rho() * TMath::Pi() * jetDef.R() * jetDef.R() - perp_sum_pt_leading;
+       hist_delta_pt->Fill(delta_pt);
+
+
+    //th_cone_median_values.push_back(thcount / (sorted_jets[0].area()));
+       perp_cone_median_values.push_back(perp_sum_pt_leading / (TMath::Pi() * jetDef.R() * jetDef.R()));
+
+
+       //hist_perp_sum->Fill(perp_sum_pt/(n_jets*TMath::Pi()*jetDef.R()*jetDef.R()));
+       perp_particles.clear();
+
+
+   }
+}
+
+
+
+
+// =============================================================================================================================================
+// PERPENDICULAR CONES, FINDING MEDIAN BACKGROUND PER JET
+// =============================================================================================================================================
+
+
+   std::sort(perp_cone_median_values.begin(), perp_cone_median_values.end());
+   double perp_median = 0.0;
+if(!perp_cone_median_values.empty()){
+
+
+   if(perp_cone_median_values.size() % 2 == 0){ //even number of jets/entries
+       perp_median = 0.5 * (perp_cone_median_values[perp_cone_median_values.size() / 2 - 1] + perp_cone_median_values[perp_cone_median_values.size() / 2]);
+   } else {
+       perp_median = perp_cone_median_values[perp_cone_median_values.size() / 2];
+   }
+
+
+   hist_perp_sum->Fill(perp_median);
+
+
+}
+  
+// =============================================================================================================================================
+// PT-CORRECTED JETS, FINDING MEDIAN BACKGROUND PER JET
+// =============================================================================================================================================
+
+
+   std::sort(th_cone_median_values.begin(), th_cone_median_values.end());
+   double th_median = 0.0;
+
+
+   if(!th_cone_median_values.empty()){
+
+
+       if(th_cone_median_values.size() % 2 == 0){ //even number of jets/entries
+       th_median = 0.5 * (th_cone_median_values[th_cone_median_values.size() / 2 - 1] + th_cone_median_values[th_cone_median_values.size() / 2]);
+   } else {
+       th_median = th_cone_median_values[th_cone_median_values.size() / 2];
+   }
+
+
+   hist_th_rho->Fill(th_median);
+   }
+  
+
+
+   perp_cone_median_values.clear();
+   th_cone_median_values.clear();
+
+
+   n_jets_total += n_jets; //getting total number of subtracted jets for normalization
+   n_pythia_jets_total += n_pythia_jets;
+   n_combined_jet_total += n_combined_jets;
+   n_th_jets_total += n_th_jets;
+   
+   jets.clear();
+   thjets.clear();
+   combined_jets.clear();
+
+
+   }
+
+
+   std::cout << "n_jets_total: " << n_jets_total << " ";
+   std::cout << "n_pythia_jets_total: " << n_pythia_jets_total << " ";
+   std::cout << "n_combined_jet_total: " << n_combined_jet_total << " ";
+
+
+   TH1F* hist_subt_particles_pt_before_subt = (TH1F*) hist_subt_particles_pt->Clone();
+
+
+// --- keep originals intact ---
+TH1F* h_purple_in = (TH1F*) hist_subt_particles_pt_before_subt->Clone("h_purple_in");
+TH1F* h_blue_in   = (TH1F*) hist_perp_particles_pt->Clone("h_blue_in");
+TH1F* h_corr_in   = (TH1F*) h_corr->Clone("h_corr_in");   // <-- rename, don't shadow
+
+
+// ============================================================
+// NO correction: purple - blue
+// ============================================================
+TH1F* h_sub_noCorr = (TH1F*) h_purple_in->Clone("h_sub_noCorr");
+h_sub_noCorr->Add(h_blue_in, -1.0);
+
+
+// ============================================================
+// WITH correction: purple - (blue * corr)
+// ============================================================
+TH1F* h_blue_scaled = (TH1F*) h_blue_in->Clone("h_blue_scaled");
+h_blue_scaled->Multiply(h_corr_in);   // multiply the PC spectrum, not the subtraction result
+
+
+TH1F* h_sub_withCorr = (TH1F*) h_purple_in->Clone("h_sub_withCorr");
+h_sub_withCorr->Add(h_blue_scaled, -1.0);
+
+
+   outFile->cd();
+
+
+    //save every histogram to root file
+   h_nThermal->Write();
+   hist_pythia_jet_pt->Write();
+   hist_pythia_jet_eta->Write();
+   hist_pythia_jet_phi->Write();
+   hist_thermal_jet_pt->Write();
+   hist_thermal_jet_eta->Write();
+   hist_thermal_jet_phi->Write();
+   hist_combined_jets_pt->Write();
+   hist_combined_jets_eta->Write();
+   hist_combined_jets_phi->Write();
+   hist_f_eta->Write();
+   hist_f_phi->Write();
+   hist_f_pt->Write();
+   hist_rho->Write();
+   hist_pythia_pt->Write();
+   hist_pythia_eta->Write();
+   hist_pythia_phi->Write();
+   hist_combined_particles_pt->Write();
+   hist_combined_particles_eta->Write();
+   hist_combined_particles_phi->Write();
+   hist_pythia_jet_constituents_pt->Write();
+   hist_pythia_jet_constituents_eta->Write();
+   hist_pythia_jet_constituents_phi->Write();
+   hist_thermal_jet_constituents_pt->Write();
+   hist_thermal_jet_constituents_eta->Write();
+   hist_thermal_jet_constituents_phi->Write();
+   hist_combined_jet_constituents_pt->Write();
+   hist_combined_jet_constituents_eta->Write();
+   hist_combined_jet_constituents_phi->Write();
+   hist_perp_particles_eta->Write();
+   hist_perp_particles_phi->Write();
+   hist_perp_particles_pt->Write();
+   hist_subt_particles_pt->Write();
+   hist_perp_sum->Write();
+   hist_subt_pt->Write();
+   hist_th_rho->Write();
+   sanity_check_above_etacut->Write();
+   sanity_check_below_areacut->Write();
+   sanity_check_areafull->Write();
+   hist_f_eta_phi->Write();
+   h_corr->Write();
+   leading_jet_thparticles_pt->Write();
+
+
+ h_nThermal->Sumw2();
+
+
+ hist_pythia_jet_pt->Sumw2();
+ hist_pythia_jet_eta->Sumw2();
+ hist_pythia_jet_phi->Sumw2();
+
+
+ hist_thermal_jet_pt->Sumw2();
+ hist_thermal_jet_eta->Sumw2();
+ hist_thermal_jet_phi->Sumw2();
+
+
+ hist_combined_jets_pt->Sumw2();
+ hist_combined_jets_eta->Sumw2();
+ hist_combined_jets_phi->Sumw2();
+
+
+ hist_f_pt->Sumw2();
+ hist_f_eta->Sumw2();
+ hist_f_phi->Sumw2();
+ hist_f_eta_phi->Sumw2();   // TH2F also has Sumw2
+
+
+ hist_rho->Sumw2();
+
+
+ hist_pythia_pt->Sumw2();
+ hist_pythia_eta->Sumw2();
+ hist_pythia_phi->Sumw2();
+
+
+ hist_combined_particles_pt->Sumw2();
+ hist_combined_particles_eta->Sumw2();
+ hist_combined_particles_phi->Sumw2();
+
+
+ hist_pythia_jet_constituents_pt->Sumw2();
+ hist_pythia_jet_constituents_eta->Sumw2();
+ hist_pythia_jet_constituents_phi->Sumw2();
+
+
+ hist_thermal_jet_constituents_pt->Sumw2();
+ hist_thermal_jet_constituents_eta->Sumw2();
+ hist_thermal_jet_constituents_phi->Sumw2();
+
+
+ hist_combined_jet_constituents_pt->Sumw2();
+ hist_combined_jet_constituents_eta->Sumw2();
+ hist_combined_jet_constituents_phi->Sumw2();
+
+
+ hist_perp_particles_pt->Sumw2();
+ hist_subt_particles_pt->Sumw2();
+ hist_perp_particles_eta->Sumw2();
+ hist_perp_particles_phi->Sumw2();
+
+
+ hist_subt_pt->Sumw2();
+ hist_perp_sum->Sumw2();
+ hist_th_rho->Sumw2();
+
+
+ sanity_check_below_areacut->Sumw2();
+ sanity_check_above_etacut->Sumw2();
+ sanity_check_areafull->Sumw2();
+
+
+   gStyle->SetHistLineWidth(4);
+   gStyle->SetOptTitle(0);   // <<< add this line
+
+
+     c1->cd();
+     h_nThermal->Draw("HIST");
+     c1->SaveAs("/Users/lilywonder/Desktop/histograms/number_of_thparticles.pdf");
+// pythia jet spectra
+     c2->cd();
+     hist_pythia_jet_pt->Draw("HIST");
+     c2->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_jet_pt.pdf");
+
+
+     c3->cd();
+     hist_pythia_jet_eta->Draw("HIST");
+     c3->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_jet_eta.pdf");
+
+
+     c4->cd();
+     hist_pythia_jet_phi->Draw("HIST");
+     c4->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_jet_phi.pdf");
+
+
+// thermal jet spectra
+     c5->cd();
+     hist_thermal_jet_pt->Draw("HIST");
+     c5->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_jet_pt.pdf");
+    
+     c6->cd();
+     hist_thermal_jet_eta->Draw("HIST");
+     c6->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_jet_eta.pdf");
+
+
+     c7->cd();
+     hist_thermal_jet_phi->Draw("HIST");
+     c7->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_jet_phi.pdf");
+// combined jet spectra
+     c9->cd();
+     hist_combined_jets_eta->Draw("HIST");
+     c9->SaveAs("/Users/lilywonder/Desktop/histograms/combined_jet_eta.pdf");
+
+
+     c10->cd();
+     hist_combined_jets_phi->Draw("HIST");
+     c10->SaveAs("/Users/lilywonder/Desktop/histograms/combined_jet_phi.pdf");
+// thermal particles spectra      
+     c11->cd();
+     hist_f_eta->Draw("HIST");
+     c11->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_particles_eta.pdf");
+
+
+     c12->cd();
+     hist_f_phi->Draw("HIST");
+     c12->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_particles_phi.pdf");
+       
+     c13->cd();
+     hist_f_pt->Scale(1.0/n_th_jets_total, "width");
+     hist_f_pt->Draw("HIST");
+     c13->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_particles_pt.pdf");
+
+
+      // rho distribution
+     c14->cd();
+
+
+     hist_rho->Draw("HIST");
+     hist_th_rho->SetLineColor(kAzure);
+     hist_perp_sum->SetLineColor(kCyan);
+     hist_perp_sum->Draw("HIST SAME");
+     hist_th_rho->Draw("HIST SAME");
+
+
+     c14->SaveAs("/Users/lilywonder/Desktop/histograms/rho.pdf");
+
+
+// pythia particles spectra    
+     c15->cd();
+     hist_pythia_pt->Scale(1.0/n_pythia_jets_total, "width");
+     hist_pythia_pt->Draw("HIST");
+     c15->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_particles_pt.pdf");
+       
+     c16->cd();
+     hist_pythia_eta->Scale(1.0/n_pythia_jets_total, "width");
+     hist_pythia_eta->Draw("HIST");
+     c16->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_particles_eta.pdf");
+       
+     c17->cd();
+     hist_pythia_phi->Draw("HIST");
+     c17->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_particles_phi.pdf");
+// combined particles spectra        
+     c18->cd();
+     hist_combined_particles_pt->Scale(1.0/n_combined_jet_total);
+     hist_combined_particles_pt->Draw("HIST");
+     c18->SaveAs("/Users/lilywonder/Desktop/histograms/combined_particles_pt.pdf");
+       
+     c19->cd();
+     hist_combined_particles_eta->Scale(1.0/n_combined_jet_total);
+     hist_combined_particles_eta->Draw("HIST");
+     c19->SaveAs("/Users/lilywonder/Desktop/histograms/combined_particles_eta.pdf");
+       
+     c20->cd();
+     hist_combined_particles_phi->Draw("HIST");
+     c20->SaveAs("/Users/lilywonder/Desktop/histograms/combined_particles_phi.pdf");
+
+
+     c22->cd();
+     hist_pythia_jet_constituents_eta->Scale(1.0/n_pythia_jets_total, "width");
+     hist_pythia_jet_constituents_eta->Draw("HIST");
+     c22->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_constituents_eta.pdf");
+       
+     c23->cd();
+     hist_pythia_jet_constituents_phi->Draw("HIST");
+     c23->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_constituents_phi.pdf");
+// thermal constituents spectra        
+     c24->cd();
+     hist_thermal_jet_constituents_pt->Draw("HIST");
+     c24->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_constituents_pt.pdf");
+       
+     c25->cd();
+     hist_thermal_jet_constituents_eta->Draw("HIST");
+     c25->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_constituents_eta.pdf");
+       
+     c26->cd();
+     hist_thermal_jet_constituents_phi->Draw("HIST");
+     c26->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_constituents_phi.pdf");
+// combined constituents spectra        
+     c27->cd();
+     hist_combined_jet_constituents_pt->Draw("HIST");
+     c27->SaveAs("/Users/lilywonder/Desktop/histograms/combined_constituents_pt.pdf");
+       
+     c28->cd();
+     hist_combined_jet_constituents_eta->Draw("HIST");
+     c28->SaveAs("/Users/lilywonder/Desktop/histograms/combined_constituents_eta.pdf");
+       
+     c29->cd();
+     hist_combined_jet_constituents_phi->Draw("HIST");
+     c29->SaveAs("/Users/lilywonder/Desktop/histograms/combined_constituents_phi.pdf");
+
+
+     c30->cd();
+     sanity_check_above_etacut->Draw("HIST");
+     c30->SaveAs("/Users/lilywonder/Desktop/histograms/sanity_check_above_etacut.pdf");
+       
+     c31->cd();
+     sanity_check_below_areacut->Draw("HIST");
+     c31->SaveAs("/Users/lilywonder/Desktop/histograms/sanity_check_below_areacut.pdf");
+       
+     c32->cd();
+     sanity_check_areafull->Draw("HIST");
+     c32->SaveAs("/Users/lilywonder/Desktop/histograms/sanity_check_areafull.pdf");
+
+
+     c33->cd();
+     hist_perp_particles_eta->Draw("HIST");
+     c33->SaveAs("/Users/lilywonder/Desktop/histograms/hist_perp_particles_eta.pdf");
+       
+     c34->cd();
+     hist_perp_particles_phi->Draw("HIST");
+     c34->SaveAs("/Users/lilywonder/Desktop/histograms/hist_perp_particles_phi.pdf");
+
+
+     c37->cd();
+     hist_perp_sum->Draw();
+     c37->SaveAs("/Users/lilywonder/Desktop/histograms/hist_perp_sum.pdf");
+  
+     c38->cd();
+     hist_delta_pt->Draw();
+     c38->SaveAs("/Users/lilywonder/Desktop/histograms/hist_delta_pt.pdf");
+
+
+             
+// ===================== PLOTS =====================
+
+
+             
+c35->cd();
+gPad->SetLogy();
+
+
+// --- clones so we don't rescale originals ---
+TH1F* h_pythia_draw  = (TH1F*) hist_pythia_jet_constituents_pt->Clone("h_pythia_draw_c35");
+TH1F* h_purple_draw  = (TH1F*) hist_subt_particles_pt_before_subt->Clone("h_purple_draw_c35");
+TH1F* h_pc_draw      = (TH1F*) hist_perp_particles_pt->Clone("h_pc_draw_c35");
+TH1F* h_sub_unc_draw = (TH1F*) h_sub_noCorr->Clone("h_sub_unc_draw_c35");   // <-- FIXED NAME
+
+
+// --- scale (only the clones) ---
+h_pythia_draw->Scale(1.0 / n_pythia_jets_total, "width");
+h_purple_draw->Scale(1.0 / n_jets_total, "width");
+h_pc_draw->Scale(1.0 / n_jets_total, "width");
+h_sub_unc_draw->Scale(1.0 / n_jets_total, "width");
+
+
+// --- colors ---
+h_pythia_draw->SetLineColor(kOrange+7);
+h_purple_draw->SetLineColor(kViolet+1);
+h_pc_draw->SetLineColor(kBlue);
+h_sub_unc_draw->SetLineColor(kBlack);
+
+
+// --- draw ---
+h_pc_draw->Draw("HIST");
+h_purple_draw->Draw("HIST SAME");
+h_pythia_draw->Draw("HIST SAME");
+h_sub_unc_draw->Draw("HIST SAME");
+
+
+// --- legend ---
+TLegend* legend = new TLegend(0.38, 0.65, 0.88, 0.88);
+legend->SetBorderSize(0);
+legend->SetFillStyle(0);
+legend->SetTextSize(0.03);
+legend->AddEntry(h_purple_draw,  "p_{T}-corrected particles (before subtraction)", "l");
+legend->AddEntry(h_pc_draw,      "Perpendicular cone particles", "l");
+legend->AddEntry(h_sub_unc_draw, "Subtracted particles (uncorrected)", "l");
+legend->AddEntry(h_pythia_draw,  "PYTHIA constituent particles", "l");
+legend->Draw();
+
+
+c35->SaveAs("/Users/lilywonder/Desktop/histograms/hist_perp_particles_pt.pdf");
+
+
+
+
+// pythia constituents spectra        
+c21->cd();
+gPad->SetLogy();
+
+
+// clones
+TH1F* h_sub_corr_draw = (TH1F*) h_sub_withCorr->Clone("h_sub_corr_draw_c21");  // <-- FIXED NAME
+TH1F* h_pythia_draw2  = (TH1F*) hist_pythia_jet_constituents_pt->Clone("h_pythia_draw_c21");
+
+
+// scale
+h_sub_corr_draw->Scale(1.0 / n_jets_total, "width");
+h_pythia_draw2->Scale(1.0 / n_pythia_jets_total, "width");
+
+
+// style
+h_sub_corr_draw->SetLineColor(kBlack);
+h_pythia_draw2->SetLineColor(kOrange+7);
+h_sub_corr_draw->SetLineWidth(1);
+h_pythia_draw2->SetLineWidth(1);
+
+
+// draw
+h_sub_corr_draw->Draw("HIST");
+h_pythia_draw2->Draw("HIST SAME");
+
+
+// legend
+TLegend* legend2 = new TLegend(0.4, 0.75, 0.88, 0.88);
+legend2->SetBorderSize(0);
+legend2->SetFillStyle(0);
+legend2->SetTextSize(0.03);
+legend2->AddEntry(h_sub_corr_draw, "Subtracted particles (PC corrected)", "l");
+legend2->AddEntry(h_pythia_draw2,  "PYTHIA jet constituents", "l");
+legend2->Draw();
+
+
+c21->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_constituents_pt.pdf");
+
+
+ c8->cd();
+gPad->SetLogy();
+
+
+TH1F* h_comb_j_draw = (TH1F*) hist_combined_jets_pt->Clone("h_comb_j_draw_c8");
+TH1F* h_subtjet_draw = (TH1F*) hist_subt_pt->Clone("h_subtjet_draw_c8");
+
+
+TLegend* legend3 = new TLegend(0.55, 0.72, 0.78, 0.84);
+legend3->SetBorderSize(0);
+legend3->SetFillStyle(0);
+legend3->SetTextSize(0.03);
+legend3->AddEntry(h_comb_j_draw, "Combined jets", "l");
+legend3->AddEntry(h_subtjet_draw, "p_{T}-corrected jets", "l");
+
+
+h_comb_j_draw->Draw("HIST");
+h_subtjet_draw->SetLineColor(kPink);
+h_subtjet_draw->Draw("HIST SAME");
+
+
+legend3->Draw();
+c8->SaveAs("/Users/lilywonder/Desktop/histograms/combined_jet_pt.pdf");
+
+
+
+
+c36->cd();
+//hist_subt_pt->Scale(1.0 / n_jets_total, "width");
+hist_subt_pt->Draw("HIST");
+gPad->SetLogy();
+c36->SaveAs("/Users/lilywonder/Desktop/histograms/hist_subt_pt.pdf");
+
+
+    
+TCanvas* c39 = new TCanvas("c39",
+                          "Thermal Particles in (eta,phi)",
+                          900, 700);
+c39->SetRightMargin(0.15);   // leave room for color bar
+c39->SetLeftMargin(0.12);
+c39->SetBottomMargin(0.12);
+
+
+hist_f_eta_phi->GetXaxis()->CenterTitle();
+hist_f_eta_phi->GetYaxis()->CenterTitle();
+hist_f_eta_phi->GetXaxis()->SetTitleSize(0.045);
+hist_f_eta_phi->GetYaxis()->SetTitleSize(0.045);
+
+
+// draw as a smooth 2D heatmap with color scale
+hist_f_eta_phi->Draw("COLZ");
+
+
+c39->SaveAs("/Users/lilywonder/Desktop/histograms/thermal_eta_phi_2D.pdf");
+
+
+
+
+// ------------------------------------------------------------
+// Recovering the Original Jet Signal -- ALICE-style axis labels
+// ------------------------------------------------------------
+gStyle->SetOptStat(0);
+gStyle->SetTitleFont(42, "XYZ");
+gStyle->SetLabelFont(42, "XYZ");
+gStyle->SetTitleSize(0.05, "XYZ");
+gStyle->SetLabelSize(0.045, "XYZ");
+gStyle->SetPadTickX(1);
+gStyle->SetPadTickY(1);
+
+
+TCanvas* c_pub2 = new TCanvas("c_pub2",
+                             "Recovering the Original Jet Signal; p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+                             900, 650);
+c_pub2->SetLogy();
+c_pub2->SetLeftMargin(0.14);
+c_pub2->SetRightMargin(0.04);
+c_pub2->SetBottomMargin(0.13);
+c_pub2->SetTopMargin(0.08);
+
+
+// ------------------------------------------------------------
+// Colors you originally used
+// ------------------------------------------------------------
+hist_pythia_jet_constituents_pt->SetLineColor(kOrange + 7);  // PYTHIA
+hist_perp_particles_pt->SetLineColor(kBlue);                // PC particles
+hist_subt_particles_pt_before_subt->SetLineColor(kViolet+1); // pT-corrected
+h_sub_noCorr->SetLineColor(kBlack);                         // <-- FIXED NAME
+
+
+// ------------------------------------------------------------
+// Marker styles (ALICE-like but keeping your colors)
+// ------------------------------------------------------------
+hist_subt_particles_pt_before_subt->SetMarkerColor(kViolet+1);
+hist_subt_particles_pt_before_subt->SetMarkerStyle(20);
+hist_subt_particles_pt_before_subt->SetMarkerSize(0.9);
+
+
+hist_perp_particles_pt->SetMarkerColor(kBlue);
+hist_perp_particles_pt->SetMarkerStyle(21);
+hist_perp_particles_pt->SetMarkerSize(0.9);
+
+
+h_sub_noCorr->SetMarkerColor(kBlack);                       // <-- FIXED NAME
+h_sub_noCorr->SetMarkerStyle(22);                           // <-- FIXED NAME
+h_sub_noCorr->SetMarkerSize(1.0);                           // <-- FIXED NAME
+
+
+hist_pythia_jet_constituents_pt->SetMarkerColor(kOrange+7);
+hist_pythia_jet_constituents_pt->SetMarkerStyle(24);
+hist_pythia_jet_constituents_pt->SetMarkerSize(1.1);
+
+
+// ------------------------------------------------------------
+// Axis frame with ALICE y-axis label
+// ------------------------------------------------------------
+TH1F* frame2 = (TH1F*) hist_perp_particles_pt->Clone("frame2");
+frame2->Reset();
+frame2->SetTitle("");
+frame2->GetXaxis()->SetTitle("p_{T}^{track} [GeV]");
+frame2->GetYaxis()->SetTitle("1/N_{jets} dN/dp_{T}^{track}");   // <- ALICE-style
+frame2->GetXaxis()->SetRangeUser(0.0, 5.0);
+frame2->GetYaxis()->SetRangeUser(1e-2, 3e2);
+frame2->Draw("AXIS");
+
+
+// ------------------------------------------------------------
+// Draw all curves as markers (no HIST steps)
+// ------------------------------------------------------------
+hist_subt_particles_pt_before_subt->Scale(1.0 / n_jets_total, "width");
+hist_perp_particles_pt->Scale(1.0 / n_jets_total, "width");
+h_sub_noCorr->Scale(1.0 / n_jets_total, "width");
+hist_pythia_jet_constituents_pt->Scale(1.0 / n_pythia_jets_total, "width");
+
+
+hist_subt_particles_pt_before_subt->Draw("E1 X0 SAME");
+hist_perp_particles_pt->Draw("E1 X0 SAME");
+h_sub_noCorr->Draw("E1 X0 SAME");                             // <-- FIXED NAME
+hist_pythia_jet_constituents_pt->Draw("E1 X0 SAME");
+
+
+// ------------------------------------------------------------
+// Legend
+// ------------------------------------------------------------
+TLegend* leg4 = new TLegend(0.42, 0.75, 0.87, 0.88);
+leg4->SetBorderSize(0);
+leg4->SetFillStyle(0);
+leg4->SetTextFont(42);
+leg4->SetTextSize(0.032);
+leg4->AddEntry(hist_subt_particles_pt_before_subt,
+              "p_{T}-corrected particles (before subtraction)", "pl");
+leg4->AddEntry(hist_perp_particles_pt,
+              "Perpendicular cone particles", "pl");
+leg4->AddEntry(h_sub_noCorr,                                         // <-- FIXED NAME
+              "Subtracted particles (purple - blue)", "pl");
+leg4->AddEntry(hist_pythia_jet_constituents_pt,
+              "PYTHIA constituent particles", "pl");
+leg4->Draw();
+
+
+c_pub2->RedrawAxis();
+c_pub2->SaveAs("/Users/lilywonder/Desktop/histograms/recovering_jet_signal_ALICEaxis.pdf");
+c_pub2->SaveAs("/Users/lilywonder/Desktop/histograms/recovering_jet_signal_ALICEaxis.pdf");
+
+
+
+
+TCanvas* c_zoom = new TCanvas("c_zoom",
+                             "Recovering the Original Jet Signal; p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+                             900, 650);
+
+
+c_zoom->SetLogy();
+c_zoom->SetLeftMargin(0.14);
+c_zoom->SetRightMargin(0.04);
+c_zoom->SetBottomMargin(0.13);
+c_zoom->SetTopMargin(0.08);
+
+
+// --- make *normalized copies* so we don't rescale the originals ---
+TH1F* h_subt_zoom  = (TH1F*) h_sub_noCorr->Clone("h_subt_zoom");            // <-- FIXED NAME
+TH1F* h_pythia_zoom = (TH1F*) hist_pythia_jet_constituents_pt->Clone("h_pythia_zoom");
+
+
+// --- styles/colors (same as big plot) ---
+h_subt_zoom->SetLineWidth(4);
+h_subt_zoom->SetMarkerColor(kBlack);
+h_subt_zoom->SetMarkerStyle(22);
+h_subt_zoom->SetMarkerSize(1.0);
+
+
+h_pythia_zoom->SetLineWidth(4);
+h_pythia_zoom->SetMarkerColor(kOrange+7);
+h_pythia_zoom->SetMarkerStyle(24);
+h_pythia_zoom->SetMarkerSize(1.1);
+
+
+// --- frame with correct axes ---
+TH1F* frame_zoom = (TH1F*) h_subt_zoom->Clone("frame_zoom");
+frame_zoom->Reset();
+frame_zoom->SetTitle("");
+frame_zoom->GetXaxis()->SetTitle("p_{T} [GeV]");
+frame_zoom->GetYaxis()->SetTitle("1/N_{jets} dN/dp_{T}^{track}");
+frame_zoom->Draw("AXIS");
+
+
+frame_zoom->GetYaxis()->SetRangeUser(1e-1, 30);
+
+
+// --- draw both spectra on the same normalised scale ---
+h_subt_zoom->Scale(1.0 / n_jets_total, "width");
+h_pythia_zoom->Scale(1.0 / n_pythia_jets_total, "width");
+h_subt_zoom->Draw("E1 X0 SAME");
+h_pythia_zoom->Draw("E1 X0 SAME");
+
+
+// legend
+TLegend* leg_pythia_constituents = new TLegend(0.42, 0.8, 0.87, 0.88);
+leg_pythia_constituents->SetBorderSize(0);
+leg_pythia_constituents->SetFillStyle(0);
+leg_pythia_constituents->SetTextFont(42);
+leg_pythia_constituents->SetTextSize(0.032);
+leg_pythia_constituents->AddEntry(h_subt_zoom,
+   "p_{T}-corrected particles (after subtraction)", "pl");
+leg_pythia_constituents->AddEntry(h_pythia_zoom,
+   "PYTHIA jet constituents", "pl");
+leg_pythia_constituents->Draw();
+
+
+c_zoom->RedrawAxis();
+c_zoom->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_constituents_pt_zoom.pdf");
+c_zoom->SaveAs("/Users/lilywonder/Desktop/histograms/pythia_constituents_pt_zoom.pdf");
+
+
+
+
+c40->cd();
+h_corr->Draw("HIST");
+c40->SaveAs("/Users/lilywonder/Desktop/histograms/correction_factor.pdf");
+
+
+
+
+// ============================================================
+// ALICE-style plot WITH correction factor applied
+// ============================================================
+
+
+TCanvas* c_pub2_corr = new TCanvas(
+   "c_pub2_corr",
+   "Recovering the Original Jet Signal (PC corrected); p_{T}^{track} [GeV]; 1/N_{jets} dN/dp_{T}^{track}",
+   900, 650);
+
+
+c_pub2_corr->SetLogy();
+c_pub2_corr->SetLeftMargin(0.14);
+c_pub2_corr->SetRightMargin(0.04);
+c_pub2_corr->SetBottomMargin(0.13);
+c_pub2_corr->SetTopMargin(0.08);
+
+
+// ------------------------------------------------------------
+// Colors (same scheme, corrected spectrum in black)
+// ------------------------------------------------------------
+hist_pythia_jet_constituents_pt->SetLineColor(kOrange + 7);
+hist_perp_particles_pt->SetLineColor(kBlue);
+hist_subt_particles_pt_before_subt->SetLineColor(kViolet + 1);
+h_sub_withCorr->SetLineColor(kBlack);                           // <-- FIXED NAME
+
+
+// ------------------------------------------------------------
+// Marker styles
+// ------------------------------------------------------------
+hist_subt_particles_pt_before_subt->SetMarkerColor(kViolet + 1);
+hist_subt_particles_pt_before_subt->SetMarkerStyle(20);
+hist_subt_particles_pt_before_subt->SetMarkerSize(0.9);
+
+
+hist_perp_particles_pt->SetMarkerColor(kBlue);
+hist_perp_particles_pt->SetMarkerStyle(21);
+hist_perp_particles_pt->SetMarkerSize(0.9);
+
+
+h_sub_withCorr->SetMarkerColor(kBlack);                         // <-- FIXED NAME
+h_sub_withCorr->SetMarkerStyle(22);                             // <-- FIXED NAME
+h_sub_withCorr->SetMarkerSize(1.0);                             // <-- FIXED NAME
+
+
+hist_pythia_jet_constituents_pt->SetMarkerColor(kOrange + 7);
+hist_pythia_jet_constituents_pt->SetMarkerStyle(24);
+hist_pythia_jet_constituents_pt->SetMarkerSize(1.1);
+
+
+// ------------------------------------------------------------
+// Axis frame (reuse binning, ALICE-style labels)
+// ------------------------------------------------------------
+TH1F* frame2_corr =
+   (TH1F*) hist_perp_particles_pt->Clone("frame2_corr");
+frame2_corr->Reset();
+frame2_corr->SetTitle("");
+frame2_corr->GetXaxis()->SetTitle("p_{T}^{track} [GeV]");
+frame2_corr->GetYaxis()->SetTitle("1/N_{jets} dN/dp_{T}^{track}");
+frame2_corr->GetXaxis()->SetRangeUser(0.0, 5.0);
+frame2_corr->GetYaxis()->SetRangeUser(1e-2, 3e2);
+frame2_corr->Draw("AXIS");
+
+
+// ------------------------------------------------------------
+// Draw spectra (markers only, no HIST)
+// ------------------------------------------------------------
+h_sub_withCorr->Scale(1.0 / n_jets_total, "width");
+
+
+hist_subt_particles_pt_before_subt->Draw("E1 X0 SAME");
+hist_perp_particles_pt->Draw("E1 X0 SAME");
+h_sub_withCorr->Draw("E1 X0 SAME");                              // <-- FIXED NAME
+hist_pythia_jet_constituents_pt->Draw("E1 X0 SAME");
+
+
+// ------------------------------------------------------------
+// Legend
+// ------------------------------------------------------------
+TLegend* leg4_corr = new TLegend(0.42, 0.75, 0.87, 0.88);
+leg4_corr->SetBorderSize(0);
+leg4_corr->SetFillStyle(0);
+leg4_corr->SetTextFont(42);
+leg4_corr->SetTextSize(0.032);
+
+
+leg4_corr->AddEntry(hist_subt_particles_pt_before_subt,
+   "p_{T}-corrected particles (before subtraction)", "pl");
+leg4_corr->AddEntry(hist_perp_particles_pt,
+   "Perpendicular cone particles", "pl");
+leg4_corr->AddEntry(h_sub_withCorr,                               // <-- FIXED NAME
+   "Subtracted particles (after PC correction)", "pl");
+leg4_corr->AddEntry(hist_pythia_jet_constituents_pt,
+   "PYTHIA constituent particles", "pl");
+
+
+leg4_corr->Draw();
+
+
+c_pub2_corr->RedrawAxis();
+c_pub2_corr->SaveAs(
+   "/Users/lilywonder/Desktop/histograms/recovering_jet_signal_ALICEaxis_corrected.pdf");
+
+
+   outFile->Close();
+   input_file->Close();
+   delete input_file;
+ 
+   pythia.stat(); // error detection at end of program
+   TBrowser *b = new TBrowser("b", "My histograms");
+   app.Run();
+ return 0;
+
+
+
+
+}
